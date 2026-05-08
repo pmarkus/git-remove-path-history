@@ -793,3 +793,189 @@ func TestComplexBranchingHistory(t *testing.T) {
 		t.Errorf("other branch tip changed: want %s, got %s", otherTipBefore, otherTipAfter)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Range syntax tests
+// ---------------------------------------------------------------------------
+
+// TestRangeSyntax_SingleRef verifies that <ref> syntax works correctly.
+func TestRangeSyntax_SingleRef(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "base", "base")
+	base := gitOut(t, dir, "rev-parse", "HEAD")
+	addCommit(t, dir, "plans/foo.md", "plan", "add plans")
+	addCommit(t, dir, "src/main.go", "code", "add src")
+
+	// Rewrite from base to HEAD using single-ref syntax
+	if err := runTool(t, dir, "plans", base); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	changed := diffFiles(t, dir, base, "HEAD")
+	if containsAny(changed, "plans") {
+		t.Errorf("plans/ still appears in diff: %v", changed)
+	}
+}
+
+// TestRangeSyntax_TrailingDots verifies that <ref>.. syntax works correctly.
+func TestRangeSyntax_TrailingDots(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "base", "base")
+	base := gitOut(t, dir, "rev-parse", "HEAD")
+	addCommit(t, dir, "plans/foo.md", "plan", "add plans")
+	addCommit(t, dir, "src/main.go", "code", "add src")
+
+	// Rewrite from base to HEAD using trailing-dots syntax
+	if err := runTool(t, dir, "plans", base+".."); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	changed := diffFiles(t, dir, base, "HEAD")
+	if containsAny(changed, "plans") {
+		t.Errorf("plans/ still appears in diff: %v", changed)
+	}
+}
+
+// TestRangeSyntax_ExplicitBothBounds verifies that <ref1>..<ref2> syntax works
+// when the upper bound is HEAD (the common case).
+func TestRangeSyntax_ExplicitBothBoundsToHEAD(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "base", "base")
+	base := gitOut(t, dir, "rev-parse", "HEAD")
+
+	addCommit(t, dir, "plans/foo.md", "plan", "add plans")
+	addCommit(t, dir, "src/main.go", "code", "add src")
+	head := gitOut(t, dir, "rev-parse", "HEAD")
+
+	// Rewrite using explicit bounds where upper bound is HEAD
+	if err := runTool(t, dir, "plans", base+".."+head); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	changed := diffFiles(t, dir, base, "HEAD")
+	if containsAny(changed, "plans") {
+		t.Errorf("plans/ still appears in diff: %v", changed)
+	}
+	if !containsAny(changed, "src") {
+		t.Errorf("src/ missing from diff: %v", changed)
+	}
+}
+
+// TestRangeSyntax_BoundsWithBranchNames verifies that branch/tag names work as refs.
+func TestRangeSyntax_BoundsWithBranchNames(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "base", "base")
+	mustGit(t, dir, "tag", "v1.0")
+	v1 := gitOut(t, dir, "rev-parse", "HEAD")
+
+	addCommit(t, dir, "plans/foo.md", "plan", "add plans")
+	addCommit(t, dir, "src/main.go", "code", "add src")
+
+	// Rewrite from v1.0 to HEAD using tag names
+	if err := runTool(t, dir, "plans", "v1.0..HEAD"); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	changed := diffFiles(t, dir, v1, "HEAD")
+	if containsAny(changed, "plans") {
+		t.Errorf("plans/ still appears in diff: %v", changed)
+	}
+	if !containsAny(changed, "src") {
+		t.Errorf("src/ missing from diff: %v", changed)
+	}
+}
+
+// TestRangeSyntax_ErrorLowerBoundNotResolved verifies error handling.
+func TestRangeSyntax_ErrorLowerBoundNotResolved(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "hello", "initial")
+
+	err := runTool(t, dir, "plans", "nonexistent..HEAD")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot resolve") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestRangeSyntax_ErrorUpperBoundNotResolved verifies error handling.
+func TestRangeSyntax_ErrorUpperBoundNotResolved(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "hello", "initial")
+
+	err := runTool(t, dir, "plans", "HEAD..nonexistent")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot resolve") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestRangeSyntax_ErrorLowerBoundNotAncestor verifies that lower bound must
+// be an ancestor of upper bound.
+func TestRangeSyntax_ErrorLowerBoundNotAncestor(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "v1", "initial")
+
+	// Create an orphan branch (not an ancestor of main)
+	mustGit(t, dir, "checkout", "--orphan", "orphan")
+	mustGit(t, dir, "rm", "-rf", ".")
+	addCommit(t, dir, "other.md", "other", "orphan commit")
+	orphanHash := gitOut(t, dir, "rev-parse", "HEAD")
+
+	// Back to main and add more commits
+	mustGit(t, dir, "checkout", "main")
+	addCommit(t, dir, "README.md", "v2", "second")
+
+	// Try to use orphan (non-ancestor) as lower bound
+	err := runTool(t, dir, "plans", orphanHash+"..HEAD")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not an ancestor") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestRangeSyntax_ErrorUpperBoundNotAncestorOfHEAD verifies that upper bound
+// must be an ancestor of or equal to HEAD.
+func TestRangeSyntax_ErrorUpperBoundNotAncestorOfHEAD(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "v1", "initial")
+	hash1 := gitOut(t, dir, "rev-parse", "HEAD")
+
+	// Create an orphan branch (not an ancestor of main)
+	mustGit(t, dir, "checkout", "--orphan", "orphan")
+	mustGit(t, dir, "rm", "-rf", ".")
+	addCommit(t, dir, "other.md", "other", "orphan commit")
+	orphanHash := gitOut(t, dir, "rev-parse", "HEAD")
+
+	// Back to main (HEAD is now hash1)
+	mustGit(t, dir, "checkout", "main")
+
+	// Try to use orphan (non-ancestor of HEAD) as upper bound
+	err := runTool(t, dir, "plans", hash1+".."+orphanHash)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not an ancestor") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestRangeSyntax_ErrorBoundsEqual verifies error when lower and upper are the same.
+func TestRangeSyntax_ErrorBoundsEqual(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "hello", "initial")
+	hash := gitOut(t, dir, "rev-parse", "HEAD")
+
+	err := runTool(t, dir, "plans", hash+".."+hash)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "nothing to rewrite") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}

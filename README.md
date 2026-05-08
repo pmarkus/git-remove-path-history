@@ -27,8 +27,14 @@ Run without arguments to see help:
 
 Basic usage:
 ```bash
-git-remove-path-history <path> [<git-ref>]
+git-remove-path-history <path> [<range>]
 ```
+
+**Range syntax:**
+- `git-remove-path-history <path>` — strip changes from HEAD only
+- `git-remove-path-history <path> <ref>` — strip changes from `<ref>` to HEAD
+- `git-remove-path-history <path> <ref>..` — same as above (trailing `..` is optional)
+- `git-remove-path-history <path> <ref1>..<ref2>` — strip changes from `<ref1>` to `<ref2>`
 
 **Examples:**
 
@@ -39,9 +45,14 @@ git-remove-path-history plans
 # Strip all changes to secret.txt from commit abc123 to HEAD
 git-remove-path-history secret.txt abc123
 
-# Strip all *.lock files from the last 5 commits
-# (find the commit hash 5 commits ago, then specify it)
-git-remove-path-history '*.lock' <hash-from-5-commits-ago>
+# Strip all changes to secret.txt from commit abc123 to HEAD (using .. syntax)
+git-remove-path-history secret.txt abc123..
+
+# Strip all *.lock files between two commits
+git-remove-path-history '*.lock' abc123..def456
+
+# Strip all *.lock files from 5 commits ago to HEAD
+git-remove-path-history '*.lock' HEAD~5..
 ```
 
 ## Warning

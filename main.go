@@ -15,7 +15,7 @@ import (
 	"strings"
 )
 
-const usageText = `Usage: git-remove-path-history <path> [<git-ref>]
+const usageText = `Usage: git-remove-path-history <path> [<range>]
 
   <path>
       Path (relative to the repository root) whose changes should be removed
@@ -28,14 +28,15 @@ const usageText = `Usage: git-remove-path-history <path> [<git-ref>]
       The path should be relative to the repository root, regardless of the
       current working directory when running this tool.
 
-  <git-ref>  (optional)
-      The git reference (commit hash, tag, branch name, …) that marks the
-      start of the rewrite range.  The range is open at the bottom:
-          <git-ref>  (exclusive — NOT rewritten)
-          ...
-          HEAD       (inclusive — rewritten)
-      The reference must be an ancestor of HEAD.
-      If omitted, only the current HEAD commit is rewritten.
+  <range>  (optional)
+      Specifies which commits to rewrite. Supports the following forms:
+        - <ref>            Rewrite from <ref> (exclusive) to HEAD (inclusive)
+        - <ref>..          Same as <ref> (trailing .. is ignored)
+        - <ref1>..<ref2>   Rewrite from <ref1> (exclusive) to <ref2> (inclusive)
+
+      Each <ref> can be a commit hash, tag, or branch name.
+      Both bounds must be ancestors of HEAD (or equal to HEAD).
+      If omitted, only the current HEAD commit is rewritten (HEAD-only mode).
 
 Effect per commit in the range:
   - If the commit added a file matching <path>:     the file is not added
@@ -82,9 +83,30 @@ func run(args []string, stdin io.Reader, dir string) error {
 		return fmt.Errorf("path argument must not be empty")
 	}
 
-	baseRef := ""
+	// Parse range argument: supports <ref>, <ref>.., or <ref1>..<ref2>
+	// If omitted, defaults to HEAD-only mode.
+	var baseRef, upperRef string
 	if len(args) == 2 {
-		baseRef = args[1]
+		rangeArg := args[1]
+		if strings.Contains(rangeArg, "..") {
+			parts := strings.Split(rangeArg, "..")
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid range syntax %q: use <ref>, <ref>.., or <ref1>..<ref2>", rangeArg)
+			}
+			baseRef = parts[0]
+			upperRef = parts[1]
+			if baseRef == "" {
+				return fmt.Errorf("invalid range syntax %q: lower bound is empty", rangeArg)
+			}
+			// If upper bound is empty, it means HEAD (implicit).
+			if upperRef == "" {
+				upperRef = "HEAD"
+			}
+		} else {
+			// Single ref: treat as <ref>..HEAD
+			baseRef = rangeArg
+			upperRef = "HEAD"
+		}
 	}
 
 	// git builds an exec.Cmd for a git invocation with
@@ -127,22 +149,39 @@ func run(args []string, stdin io.Reader, dir string) error {
 	}
 
 	// -----------------------------------------------------------------------
-	// Resolve branch and current HEAD
+	// Resolve branch and upper bound
 	// -----------------------------------------------------------------------
+
+	// If no upper ref was specified, use HEAD.
+	if upperRef == "" {
+		upperRef = "HEAD"
+	}
+
+	// Resolve the upper bound to a hash. This must be on the current branch
+	// or an ancestor of it, so that we can use the current branch ref for
+	// git-filter-repo's --refs flag.
+	currentHead, err := gitOut("rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("cannot resolve HEAD: %w", err)
+	}
+
+	upperHash, err := gitOut("rev-parse", upperRef+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("cannot resolve %q to a commit", upperRef)
+	}
+
+	// The upper bound must be on the current branch (an ancestor of or equal to HEAD).
+	if upperHash != currentHead {
+		if err := git("merge-base", "--is-ancestor", upperHash, "HEAD").Run(); err != nil {
+			return fmt.Errorf("%q (%s) is not an ancestor of HEAD (%s)", upperRef, upperHash, currentHead)
+		}
+	}
 
 	currentBranch, err := gitOut("symbolic-ref", "--short", "HEAD")
 	if err != nil {
 		return fmt.Errorf("not on a branch (detached HEAD). Check out a branch first")
 	}
 	filterRef := "refs/heads/" + currentBranch
-
-	// Resolved once as a hash for equality checks and display only.
-	// All git subprocess calls use HEAD or baseHash directly to avoid
-	// passing a raw hash that could collide with an accidentally named ref.
-	currentHead, err := gitOut("rev-parse", "HEAD")
-	if err != nil {
-		return fmt.Errorf("cannot resolve HEAD: %w", err)
-	}
 
 	// -----------------------------------------------------------------------
 	// Resolve commit range
@@ -161,31 +200,31 @@ func run(args []string, stdin io.Reader, dir string) error {
 			return fmt.Errorf("%q (%s) is not an ancestor of HEAD (%s)", baseRef, baseHash, currentHead)
 		}
 
-		if baseHash == currentHead {
-			return fmt.Errorf("%q resolves to the current HEAD — nothing to rewrite", baseRef)
+		if baseHash == upperHash {
+			return fmt.Errorf("%q resolves to the upper bound — nothing to rewrite", baseRef)
 		}
 
-		refRange = baseHash + ".." + currentHead
+		refRange = baseHash + ".." + upperHash
 
-		listOut, err := gitOut("rev-list", "--reverse", baseHash+"..HEAD")
+		listOut, err := gitOut("rev-list", "--reverse", baseHash+".."+upperHash)
 		if err != nil {
 			return fmt.Errorf("cannot list commits in range: %w", err)
 		}
 		rangeHashes = strings.Split(strings.TrimSpace(listOut), "\n")
 
 	} else {
-		parentHash, parentErr := gitOut("rev-parse", "HEAD^")
+		parentHash, parentErr := gitOut("rev-parse", upperHash+"^")
 		// parentHash is only valid when the command succeeded AND returned a
 		// 40-character hex hash.  On a root commit git rev-parse HEAD^ exits
 		// with a non-zero status; guard against any git version that might
 		// print the literal string "HEAD^" to stdout instead of failing cleanly.
 		if parentErr == nil && len(parentHash) == 40 {
-			refRange = parentHash + ".." + currentHead
+			refRange = parentHash + ".." + upperHash
 		} else {
 			// Root commit: no parent exists.
-			refRange = currentHead
+			refRange = upperHash
 		}
-		rangeHashes = []string{currentHead}
+		rangeHashes = []string{upperHash}
 	}
 
 	commitCount := len(rangeHashes)

@@ -30,18 +30,23 @@ Path relative to the repository root whose changes should be stripped. Can be:
 - A directory — e.g. `src/generated`
 - A glob pattern — e.g. `*.lock` (uses Python `fnmatch`; `*` and `?` are supported, `**` is not)
 
-### `<git-ref>` (optional)
-A git reference (commit hash, tag, branch name, …) marking the exclusive lower bound of the rewrite range. The range is:
+### `<range>` (optional)
+Specifies which commits to rewrite. Supports the following forms:
 
-```
-<git-ref>  (exclusive — NOT rewritten)
-...
-HEAD       (inclusive — rewritten)
-```
+| Form | Lower bound (exclusive) | Upper bound (inclusive) |
+|---|---|---|
+| *(omitted)* | `HEAD^` | `HEAD` |
+| `<ref>` | `<ref>` | `HEAD` |
+| `<ref>..` | `<ref>` | `HEAD` |
+| `<ref1>..<ref2>` | `<ref1>` | `<ref2>` |
 
-If omitted, only the current HEAD commit is rewritten.
-
-The reference must be a strict ancestor of HEAD. It is resolved to a concrete commit hash at startup.
+Rules:
+- `<ref>` and `<ref>..` are treated identically.
+- Each ref can be a commit hash, tag, or branch name.
+- The lower bound is always **exclusive** (the referenced commit itself is not rewritten).
+- The upper bound is always **inclusive**.
+- Both bounds must be ancestors of HEAD (or equal to HEAD) so that the current branch ref can be used for `--refs` to git-filter-repo.
+- If omitted, only the current HEAD commit is rewritten (HEAD-only mode).
 
 ## Pre-flight checks
 

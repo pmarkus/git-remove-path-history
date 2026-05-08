@@ -22,6 +22,8 @@ This project uses **spec-driven development**.
 - Any behaviour, constraint, or implementation detail that was discussed and acted upon must be captured in `spec.md` — not just features, but also correctness constraints (e.g. "commits outside the range must not be rehashed").
 - Update `README.md` if invocation syntax, arguments, or user-facing behaviour changed.
 - Verify that `usageText` in `main.go` remains consistent with `README.md` examples.
+- **Write tests for all new functionality.** Either use TDD (write tests first), or implement then immediately write tests. Do not implement features without tests. Unit tests should cover edge cases; integration tests should cover user-facing workflows and error conditions.
+- Verify that all tests (old and new) pass.
 
 ## Documentation artifacts
 
@@ -33,7 +35,13 @@ The following files are derived from the implementation and must be kept in sync
 | `main.go` `usageText` constant | CLI help text displayed by `./git-remove-path-history --help` | When README examples or argument descriptions change |
 | `.agents/spec.md` | Authoritative technical specification of current behaviour | After every implementation change, before task is complete |
 
-**Definition of "done":** A task is complete only when all three are in sync and reflect the final state.
+**Definition of "done":** A task is complete only when all the following are true:
+1. Implementation conforms to `.agents/spec.md` (or a new spec.md entry has been added)
+2. `.agents/spec.md` is updated to reflect the new behaviour
+3. `README.md` is updated if user-facing syntax/behaviour changed
+4. `usageText` in `main.go` is consistent with README examples
+5. Tests are written for all new functionality (TDD preferred; otherwise tests must immediately follow implementation)
+6. All tests pass (both old and new)
 
 ## Repository layout
 
