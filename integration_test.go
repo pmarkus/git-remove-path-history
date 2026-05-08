@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -106,16 +107,60 @@ func containsAny(paths []string, prefix string) bool {
 	return false
 }
 
-// runTool calls run() with "y" as the confirmation answer.
+// runTool calls run() with "y" as the confirmation answer, suppressing output
+// unless the test fails.
 func runTool(t *testing.T, dir string, args ...string) error {
 	t.Helper()
-	return run(args, strings.NewReader("y\n"), dir)
+	return runToolWithOutput(t, dir, false, args...)
 }
 
 // runToolAbort calls run() with "N" as the confirmation answer.
 func runToolAbort(t *testing.T, dir string, args ...string) error {
 	t.Helper()
 	return run(args, strings.NewReader("N\n"), dir)
+}
+
+// runToolWithOutput is the internal implementation that can optionally suppress output.
+// If showOutput is false, stdout/stderr are captured and only printed on failure.
+func runToolWithOutput(t *testing.T, dir string, showOutput bool, args ...string) error {
+	t.Helper()
+	if showOutput {
+		// No suppression: let output through normally.
+		return run(args, strings.NewReader("y\n"), dir)
+	}
+
+	// Capture stdout and stderr.
+	oldStdout := os.Stdout
+	oldStderr := os.Stderr
+	rOut, wOut, _ := os.Pipe()
+	rErr, wErr, _ := os.Pipe()
+
+	os.Stdout = wOut
+	os.Stderr = wErr
+
+	err := run(args, strings.NewReader("y\n"), dir)
+
+	// Close the write ends so the read ends will EOF.
+	wOut.Close()
+	wErr.Close()
+
+	// Restore stdout/stderr.
+	os.Stdout = oldStdout
+	os.Stderr = oldStderr
+
+	// Read captured output.
+	outBytes, _ := io.ReadAll(rOut)
+	errBytes, _ := io.ReadAll(rErr)
+
+	// If the test failed, print the captured output for debugging.
+	if err != nil {
+		t.Log("\n=== Captured stdout ===")
+		t.Log(string(outBytes))
+		t.Log("\n=== Captured stderr ===")
+		t.Log(string(errBytes))
+	}
+
+	return err
 }
 
 // ---------------------------------------------------------------------------
