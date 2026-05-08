@@ -6,8 +6,8 @@ import (
 )
 
 // matchesPath reports whether filePath should be stripped based on
-// filterPattern.  The logic mirrors the regex produced by pathToRegex so
-// that tests can verify matching behaviour without invoking git-filter-repo.
+// filterPattern. This function implements the same path-matching logic used
+// by the rewriter, allowing tests to verify matching behaviour directly.
 //
 // Rules:
 //
@@ -28,8 +28,8 @@ func matchesPath(filterPattern, filePath string) bool {
 	return re.MatchString(filePath)
 }
 
-// pathToRegex converts a filter pattern into a Python regex string suitable
-// for passing to git-filter-repo's --path-regex flag.
+// pathToRegex converts a filter pattern into a Python regex string used by
+// the current rewriter implementation.
 //
 // The regex matches:
 //   - The exact path (e.g. "src/config.json")

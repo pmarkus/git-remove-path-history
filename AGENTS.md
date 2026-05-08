@@ -2,7 +2,7 @@
 
 ## Project overview
 
-`git-remove-path-history` is a Go command-line tool that rewrites a range of git commits to strip all changes to a given path, leaving those files at the state they had just before the range begins. It delegates the actual rewriting to `git-filter-repo`.
+`git-remove-path-history` is a Go command-line tool that rewrites a range of git commits to strip all changes to a given path, leaving those files at the state they had just before the range begins.
 
 ## Working in this project
 
@@ -58,7 +58,6 @@ The following files are derived from the implementation and must be kept in sync
 
 ## Constraints
 
-- The tool must compile to a single self-contained binary with no runtime dependencies beyond `git` and `git-filter-repo`.
+- The tool must compile to a single self-contained binary with no runtime dependencies beyond `git`.
 - The tool must remain portable across standard Linux/macOS environments.
 - External Go dependencies beyond the standard library must not be introduced without explicit instruction.
-- The Python callback embedded in `filterCallback` (in `main.go`) and the Go `matchesPath` function (in `match.go`) implement the same path-matching logic. They must be kept in sync.

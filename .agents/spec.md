@@ -10,11 +10,11 @@ An AI agent must read this file before making changes to understand what exists,
 
 ## Purpose
 
-Rewrites a range of git commits to strip all changes to a given path, leaving those files at the state they had just before the range begins. Delegates the actual rewriting to `git-filter-repo`.
+Rewrites a range of git commits to strip all changes to a given path, leaving those files at the state they had just before the range begins. Uses git plumbing commands (`read-tree`, `update-index`, `write-tree`, `commit-tree`) to rewrite only the commits in the range while leaving commits outside the range completely untouched with their hashes preserved.
 
 ## Implementation language
 
-The tool is implemented in Go. Entry point: `main.go`. Path matching logic: `match.go`.
+The tool is implemented in Go. Entry point: `main.go`. Rewriter logic: `rewriter.go`. Path matching logic: `match.go`.
 
 ## Invocation
 
@@ -52,10 +52,9 @@ Rules:
 
 Before doing any work the tool verifies:
 1. The current directory is inside a git repository.
-2. `git-filter-repo` is installed.
-3. The working tree has no unstaged changes.
-4. The index has no staged changes.
-5. HEAD is on a named branch (detached HEAD is not supported).
+2. The working tree has no unstaged changes.
+3. The index has no staged changes.
+4. HEAD is on a named branch (detached HEAD is not supported).
 
 ## Effect per commit
 
@@ -75,14 +74,19 @@ Before rewriting, the tool prints a summary (repository root, path filter, commi
 
 ## Implementation notes
 
-- The core logic lives in `run(args []string, stdin io.Reader, dir string) error` in `main.go`. Accepting `stdin` and `dir` as parameters makes the function directly testable without subprocess overhead.
-- `git-filter-repo` is invoked with `--refs refs/heads/<branch>` (the current branch) so that the branch pointer is updated after rewriting.
-- **No `^BASE` ref is passed to `--refs`.** When git-filter-repo receives a negative ref (`^hash`) alongside a positive ref, the positive ref is silently dropped from the internal `git fast-export` command, causing the callback to never be invoked. Instead, range-limiting is done inside the callback via a `_rewrite_set`: `git rev-list BASE..HEAD` is called in Go before invoking git-filter-repo, and the resulting commit hashes are embedded in the callback as a Python `frozenset`-style set literal. The callback is a no-op for commits whose `original_id` is not in the set. Commits outside the range pass through fast-export/import unmodified, preserving their hashes (same tree + same parent + same metadata = same hash).
-- The Python callback is built in `run()` using `fmt.Sprintf` and passed to `git-filter-repo` via `--commit-callback`. It uses `commit.original_id` (bytes) for the range check and `fc.filename` (also bytes) for path matching. The regex is compiled as a Python bytes pattern (`b"..."`) using the string produced by `pathToRegex()`.
-- `match.go` contains a Go implementation of the same path-matching logic (`matchesPath`) and the regex-building logic (`pathToRegex`). It mirrors the Python callback and is used by unit tests. The two implementations must be kept in sync.
-- `--prune-empty` is left at its default (`auto`): commits that become empty after filtering are dropped. This means test scenarios should not create commits whose *only* changes are to the filtered path unless the test is specifically verifying that the empty commit is dropped. In particular, the root commit and HEAD-only-mode tests must include at least one non-filtered file change so the rewritten commit is not pruned.
-- All git subprocess calls use `HEAD` rather than the resolved HEAD hash to avoid triggering the "refname is ambiguous" advisory in repositories that happen to have a ref named after a commit hash. The resolved hash (`currentHead`) is retained for equality comparisons and display only.
-- `advice.objectNameWarning=false` is passed to every git invocation as a safety net via the `git` closure inside `run()`.
+- The core logic lives in `run(args []string, stdin io.Reader, dir string) error` in `main.go` and the `Rewriter` type in `rewriter.go`. Accepting `stdin` and `dir` as parameters makes the function directly testable without subprocess overhead.
+- The rewriter walks each commit in the range (oldest to newest), using the following algorithm for each commit:
+  1. Load the rewritten parent's tree into a temporary git index using `git read-tree`.
+  2. Get the list of file changes in the original commit via `git diff-tree -r --name-status`.
+  3. For each non-filtered file change, update the index using `git update-index` (additions/modifications use `--cacheinfo`, deletions use `--remove`).
+  4. Write a new tree from the modified index using `git write-tree`.
+  5. Create a new commit using `git commit-tree` with the original commit's author name, email, date, committer name, email, date, and message (preserving all metadata).
+  6. If the rewritten commit has no kept changes (all changes were filtered), the commit is pruned (no new commit object is created).
+- All commits outside the range are **never processed**. Their objects remain untouched in the git database and their hashes are guaranteed to remain the same.
+- A temporary index file (`GIT_INDEX_FILE`) is used for each rewrite to avoid disturbing the working tree's real index.
+- The branch ref is updated to point to the new HEAD after rewriting using `git update-ref`.
+- The working tree and index are then reset using `git reset --hard` to match the new HEAD.
+- `match.go` contains the path-matching logic (`matchesPath`) and the regex-building logic (`pathToRegex`) used by the rewriter's filtering callback. Tests use these functions directly to verify matching behavior.
 
 ## Test suite
 
@@ -92,16 +96,19 @@ Integration tests (`integration_test.go`) call `run()` directly against temporar
 - Pre-flight checks (not a repo, empty path, unstaged/staged changes, detached HEAD, bad/non-ancestor/HEAD base ref)
 - Confirmation abort
 - Stripping a directory, a single file, and glob-matched files
-- Commits before the range keeping their original hashes
+- Commits before the range keeping their original hashes (validated by exact hash reachability checks, not only diff shape)
 - Commits in the range getting new hashes
 - HEAD-only mode (no base ref)
 - Root commit (no parent)
 - Stripping a deleted file and a modified file
 - Multiple commits in range
-- Non-matching path (no-op)
+- Non-matching path (no-op, with unchanged hash assertion)
 - Empty commits after strip being dropped (`--prune-empty auto`)
 - Commits on an unrelated branch being untouched
 - Complex branching history with merge commits, empty merge dropping, and multi-file commits
+- Hash-preservation with a merge commit at the lower bound
+- Black-box CLI run (compiled binary) preserving hashes at/before lower bound
+- Commit metadata preservation: author name, author email, author date, committer name, committer email, committer date, and commit message are all preserved verbatim on rewritten commits (`TestCommitMetadataPreservedAfterRewrite`)
 
 ## Output
 

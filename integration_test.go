@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -107,6 +108,25 @@ func containsAny(paths []string, prefix string) bool {
 	return false
 }
 
+// reachableHashSet returns all commit hashes reachable from HEAD.
+func reachableHashSet(t *testing.T, dir string) map[string]bool {
+	t.Helper()
+	set := make(map[string]bool)
+	for _, h := range commitHashes(t, dir, "HEAD") {
+		set[h] = true
+	}
+	return set
+}
+
+// assertHashReachable verifies that an exact commit hash still exists in
+// reachable history after a rewrite.
+func assertHashReachable(t *testing.T, dir, hash, context string) {
+	t.Helper()
+	if !reachableHashSet(t, dir)[hash] {
+		t.Errorf("expected unchanged commit hash %s to remain reachable (%s)", hash, context)
+	}
+}
+
 // runTool calls run() with "y" as the confirmation answer, suppressing output
 // unless the test fails.
 func runTool(t *testing.T, dir string, args ...string) error {
@@ -161,6 +181,184 @@ func runToolWithOutput(t *testing.T, dir string, showOutput bool, args ...string
 	}
 
 	return err
+}
+
+// runToolBinary builds the current package as a standalone binary and runs it
+// against the provided repository directory, answering the confirmation prompt
+// with "y".
+func runToolBinary(t *testing.T, repoDir string, args ...string) error {
+	t.Helper()
+	binDir := t.TempDir()
+	binPath := filepath.Join(binDir, "git-remove-path-history-test-bin")
+
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(binPath, args...)
+	cmd.Dir = repoDir
+	cmd.Stdin = strings.NewReader("y\n")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Logf("binary stdout/stderr:\n%s", string(out))
+		return err
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flight check tests
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Commit-metadata helpers
+// ---------------------------------------------------------------------------
+
+// commitMeta holds the author/committer metadata that must be preserved
+// verbatim across a rewrite.
+type commitMeta struct {
+	authorName     string
+	authorEmail    string
+	authorDate     string // ISO 8601 strict (e.g. "2020-01-15T10:30:00+00:00")
+	committerName  string
+	committerEmail string
+	committerDate  string // ISO 8601 strict
+	message        string // full commit message body, trailing newline stripped
+}
+
+// mustGitEnv runs a git command with Dir=dir and fatals on error.
+// env is a list of "KEY=VALUE" strings added on top of the current process
+// environment (later entries override earlier ones for the same key).
+func mustGitEnv(t *testing.T, dir string, env []string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+// commitWithMeta commits whatever is currently staged in dir, using the
+// author/committer identity and message from meta.
+func commitWithMeta(t *testing.T, dir, message string, meta commitMeta) {
+	t.Helper()
+	mustGitEnv(t, dir, []string{
+		"GIT_AUTHOR_NAME=" + meta.authorName,
+		"GIT_AUTHOR_EMAIL=" + meta.authorEmail,
+		"GIT_AUTHOR_DATE=" + meta.authorDate,
+		"GIT_COMMITTER_NAME=" + meta.committerName,
+		"GIT_COMMITTER_EMAIL=" + meta.committerEmail,
+		"GIT_COMMITTER_DATE=" + meta.committerDate,
+	}, "commit", "-m", message)
+}
+
+// getCommitMeta reads author/committer metadata and the full commit message
+// from the given commit hash using git log.
+func getCommitMeta(t *testing.T, dir, hash string) commitMeta {
+	t.Helper()
+	// Use %x00 (NUL) as a field delimiter so that commit messages containing
+	// newlines do not confuse parsing.  SplitN preserves the rest of the body
+	// as a single element.
+	const format = "%aN%x00%aE%x00%aI%x00%cN%x00%cE%x00%cI%x00%B"
+	out := gitOut(t, dir, "log", "-1", "--format="+format, hash)
+	parts := strings.SplitN(out, "\x00", 7)
+	if len(parts) != 7 {
+		t.Fatalf("getCommitMeta(%s): expected 7 NUL-delimited fields, got %d; raw output: %q",
+			hash, len(parts), out)
+	}
+	return commitMeta{
+		authorName:     parts[0],
+		authorEmail:    parts[1],
+		authorDate:     parts[2],
+		committerName:  parts[3],
+		committerEmail: parts[4],
+		committerDate:  parts[5],
+		message:        strings.TrimRight(parts[6], "\n"),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metadata preservation test
+// ---------------------------------------------------------------------------
+
+// TestCommitMetadataPreservedAfterRewrite verifies that author name, author
+// email, author date, committer name, committer email, committer date, and
+// commit message are all preserved verbatim on commits that are rewritten by
+// the tool. This is a core requirement that must hold regardless of the
+// rewriting mechanism used.
+func TestCommitMetadataPreservedAfterRewrite(t *testing.T) {
+	dir := makeRepo(t)
+	addCommit(t, dir, "README.md", "base", "base")
+	base := gitOut(t, dir, "rev-parse", "HEAD")
+
+	janeMeta := commitMeta{
+		authorName:     "Jane Doe",
+		authorEmail:    "jane@example.com",
+		authorDate:     "2020-01-15T10:30:00+00:00",
+		committerName:  "Jane Doe",
+		committerEmail: "jane@example.com",
+		committerDate:  "2020-01-15T10:30:00+00:00",
+	}
+	bobMeta := commitMeta{
+		authorName:     "Bob Smith",
+		authorEmail:    "bob@example.org",
+		authorDate:     "2020-03-22T06:00:00+00:00",
+		committerName:  "Bob Smith",
+		committerEmail: "bob@example.org",
+		committerDate:  "2020-03-22T06:00:00+00:00",
+	}
+
+	// Commit A: touches the filtered path (plans/) AND a kept path (keep/).
+	// After stripping plans/ it must survive as a non-empty commit.
+	writeFile(t, dir, "plans/x.md", "plan content")
+	writeFile(t, dir, "keep/a.txt", "keep content")
+	mustGit(t, dir, "add", "plans/x.md", "keep/a.txt")
+	commitWithMeta(t, dir, "commit A", janeMeta)
+
+	// Commit B: touches only a kept path.  Its parent will change after A is
+	// rewritten, so it also receives a new hash, but metadata must survive.
+	writeFile(t, dir, "keep/b.txt", "b content")
+	mustGit(t, dir, "add", "keep/b.txt")
+	commitWithMeta(t, dir, "commit B", bobMeta)
+
+	if err := runTool(t, dir, "plans", base); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// Both commits survive the rewrite (neither becomes empty).
+	rewrittenHashes := commitHashes(t, dir, base+"..HEAD")
+	if len(rewrittenHashes) != 2 {
+		t.Fatalf("expected 2 rewritten commits, got %d", len(rewrittenHashes))
+	}
+
+	// Commit A' is the first commit after base; commit B' is the second.
+	gotA := getCommitMeta(t, dir, rewrittenHashes[0])
+	gotB := getCommitMeta(t, dir, rewrittenHashes[1])
+
+	for _, tc := range []struct {
+		field string
+		got   string
+		want  string
+	}{
+		{"A author name", gotA.authorName, janeMeta.authorName},
+		{"A author email", gotA.authorEmail, janeMeta.authorEmail},
+		{"A author date", gotA.authorDate, janeMeta.authorDate},
+		{"A committer name", gotA.committerName, janeMeta.committerName},
+		{"A committer email", gotA.committerEmail, janeMeta.committerEmail},
+		{"A committer date", gotA.committerDate, janeMeta.committerDate},
+		{"A message", gotA.message, "commit A"},
+		{"B author name", gotB.authorName, bobMeta.authorName},
+		{"B author email", gotB.authorEmail, bobMeta.authorEmail},
+		{"B author date", gotB.authorDate, bobMeta.authorDate},
+		{"B committer name", gotB.committerName, bobMeta.committerName},
+		{"B committer email", gotB.committerEmail, bobMeta.committerEmail},
+		{"B committer date", gotB.committerDate, bobMeta.committerDate},
+		{"B message", gotB.message, "commit B"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("commit %s: got %q, want %q", tc.field, tc.got, tc.want)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +527,8 @@ func TestStripDirectoryInRange(t *testing.T) {
 	if !containsAny(changed, "src") {
 		t.Errorf("src/ changes were unexpectedly removed: %v", changed)
 	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
 }
 
 // TestStripSingleFileInRange verifies that only the targeted file is removed.
@@ -352,6 +552,8 @@ func TestStripSingleFileInRange(t *testing.T) {
 	if !containsAny(changed, "public.txt") {
 		t.Errorf("public.txt was unexpectedly removed from diff: %v", changed)
 	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
 }
 
 // TestStripGlobMatchedFiles verifies that glob patterns strip all matching files.
@@ -376,6 +578,8 @@ func TestStripGlobMatchedFiles(t *testing.T) {
 	if !containsAny(changed, "src/main.go") {
 		t.Errorf("src/main.go was unexpectedly removed: %v", changed)
 	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
 }
 
 // TestCommitsBeforeRangeUntouched verifies that commits before the base ref
@@ -493,6 +697,8 @@ func TestStripDeletedFile(t *testing.T) {
 			t.Errorf("plans/foo.md still appears in diff (deletion not undone): %v", changed)
 		}
 	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
 }
 
 // TestStripModifiedFile verifies that if a commit modifies a filtered file,
@@ -513,6 +719,8 @@ func TestStripModifiedFile(t *testing.T) {
 			t.Errorf("plans/foo.md still appears in diff (modification not undone): %v", changed)
 		}
 	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
 }
 
 // TestMultipleCommitsInRange verifies all commits in a multi-commit range are
@@ -537,6 +745,8 @@ func TestMultipleCommitsInRange(t *testing.T) {
 	if !containsAny(changed, "src") {
 		t.Errorf("src/ unexpectedly missing from diff: %v", changed)
 	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
 }
 
 // TestNonMatchingPathUnchanged verifies that specifying a path that has no
@@ -546,6 +756,7 @@ func TestNonMatchingPathUnchanged(t *testing.T) {
 	addCommit(t, dir, "README.md", "base", "base")
 	base := gitOut(t, dir, "rev-parse", "HEAD")
 	addCommit(t, dir, "src/main.go", "package main", "add src")
+	headBefore := gitOut(t, dir, "rev-parse", "HEAD")
 
 	// Filter a path that does not exist in the range
 	if err := runTool(t, dir, "plans", base); err != nil {
@@ -553,9 +764,13 @@ func TestNonMatchingPathUnchanged(t *testing.T) {
 	}
 
 	hashAfter := gitOut(t, dir, "rev-parse", "HEAD")
-	// The commit has no plans changes to strip, but git-filter-repo still
-	// rewrites it (same tree, new hash) — this is acceptable. We just verify
-	// that the src change is still present.
+	if hashAfter != headBefore {
+		t.Errorf("non-matching range commit changed hash unexpectedly: before=%s after=%s", headBefore, hashAfter)
+	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
+
+	// The src change should still be present.
 	changed := diffFiles(t, dir, base, hashAfter)
 	if !containsAny(changed, "src/main.go") {
 		t.Errorf("src/main.go missing after filtering unrelated path: %v", changed)
@@ -591,8 +806,7 @@ func stageAllAndCommit(t *testing.T, dir, message string) {
 
 // TestEmptyCommitAfterStripIsDropped verifies that a commit whose only
 // changes are to the filtered path is dropped entirely from history (not
-// kept as an empty commit).  This requires git-filter-repo's default
-// --prune-empty auto behaviour; passing --prune-empty never would break it.
+// kept as an empty commit).
 func TestEmptyCommitAfterStripIsDropped(t *testing.T) {
 	dir := makeRepo(t)
 	addCommit(t, dir, "keep/a.txt", "ka", "base")
@@ -794,6 +1008,92 @@ func TestComplexBranchingHistory(t *testing.T) {
 	}
 }
 
+// TestBinaryCLI_CommitsBeforeRangeUntouched verifies hash-preservation for
+// commits at/before base when running the compiled CLI binary (black-box).
+func TestBinaryCLI_CommitsBeforeRangeUntouched(t *testing.T) {
+	dir := makeRepo(t)
+
+	addCommit(t, dir, "keep/a.txt", "a1", "01: keep/a")
+	addCommit(t, dir, "keep/b.txt", "b1", "02: keep/b")
+
+	base := gitOut(t, dir, "rev-parse", "HEAD")
+	prefixBefore := commitHashes(t, dir, base)
+
+	addCommit(t, dir, "plans/x.md", "x1", "03: plans/x")
+	addCommit(t, dir, "keep/c.txt", "c1", "04: keep/c")
+
+	if err := runToolBinary(t, dir, "plans", base+".."); err != nil {
+		t.Fatalf("binary run failed: %v", err)
+	}
+
+	for _, h := range prefixBefore {
+		assertHashReachable(t, dir, h, "prefix hash should stay reachable in binary run")
+	}
+}
+
+// TestCommitsBeforeRangeUntouched_WithMergeBeforeBase verifies that a merge
+// commit chosen as base keeps its hash and remains reachable after rewrite.
+func TestCommitsBeforeRangeUntouched_WithMergeBeforeBase(t *testing.T) {
+	dir := makeRepo(t)
+
+	addCommit(t, dir, "keep/root.txt", "root", "01: root")
+
+	mustGit(t, dir, "checkout", "-b", "feature")
+	addCommit(t, dir, "keep/feat.txt", "feat", "02f: feature commit")
+
+	mustGit(t, dir, "checkout", "main")
+	addCommit(t, dir, "keep/main.txt", "main", "02m: main commit")
+	mustGit(t, dir, "merge", "--no-ff", "-m", "03: merge feature", "feature")
+
+	base := gitOut(t, dir, "rev-parse", "HEAD")
+	prefixBefore := commitHashes(t, dir, base)
+
+	addCommit(t, dir, "plans/a.md", "pa", "04: plans change")
+	addCommit(t, dir, "keep/after.txt", "ka", "05: keep after")
+
+	if err := runTool(t, dir, "plans", base+".."); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	for _, h := range prefixBefore {
+		assertHashReachable(t, dir, h, "prefix hash should stay reachable with merge base")
+	}
+}
+
+// TestFilterRepoPreservesOutOfRangeHashes is a regression test for a known
+// failure mode in the current implementation.
+//
+// The tool must guarantee that commits before the rewrite range retain their
+// original hashes. The current git-filter-repo based implementation does not
+// provide this guarantee; see .agents/investigation-filter-repo.md for details.
+// This test documents the requirement. When the implementation is replaced
+// (per .agents/plan.md item 2), this test will transition from a known-broken
+// test to a mandatory correctness check.
+func TestFilterRepoPreservesOutOfRangeHashes(t *testing.T) {
+	dir := makeRepo(t)
+
+	// Build a simple history: 3 commits before base, then 2 in the range.
+	addCommit(t, dir, "keep/a.txt", "a1", "pre-1: before range")
+	addCommit(t, dir, "keep/b.txt", "b1", "pre-2: before range")
+	addCommit(t, dir, "keep/c.txt", "c1", "pre-3: before range")
+
+	base := gitOut(t, dir, "rev-parse", "HEAD")
+	prefixBefore := commitHashes(t, dir, base)
+
+	// These two commits are IN the range.
+	addCommit(t, dir, "plans/x.md", "x1", "in-range-1: plans change")
+	addCommit(t, dir, "keep/d.txt", "d1", "in-range-2: non-plans change")
+
+	if err := runTool(t, dir, "plans", base+".."); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	// Every commit at or before base must keep its original hash.
+	for i, h := range prefixBefore {
+		assertHashReachable(t, dir, h, fmt.Sprintf("pre-range commit %d must be unchanged", i+1))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Range syntax tests
 // ---------------------------------------------------------------------------
@@ -815,6 +1115,8 @@ func TestRangeSyntax_SingleRef(t *testing.T) {
 	if containsAny(changed, "plans") {
 		t.Errorf("plans/ still appears in diff: %v", changed)
 	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
 }
 
 // TestRangeSyntax_TrailingDots verifies that <ref>.. syntax works correctly.
@@ -834,6 +1136,8 @@ func TestRangeSyntax_TrailingDots(t *testing.T) {
 	if containsAny(changed, "plans") {
 		t.Errorf("plans/ still appears in diff: %v", changed)
 	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
 }
 
 // TestRangeSyntax_ExplicitBothBounds verifies that <ref1>..<ref2> syntax works
@@ -859,6 +1163,8 @@ func TestRangeSyntax_ExplicitBothBoundsToHEAD(t *testing.T) {
 	if !containsAny(changed, "src") {
 		t.Errorf("src/ missing from diff: %v", changed)
 	}
+
+	assertHashReachable(t, dir, base, "base commit before rewrite range")
 }
 
 // TestRangeSyntax_BoundsWithBranchNames verifies that branch/tag names work as refs.
@@ -883,6 +1189,8 @@ func TestRangeSyntax_BoundsWithBranchNames(t *testing.T) {
 	if !containsAny(changed, "src") {
 		t.Errorf("src/ missing from diff: %v", changed)
 	}
+
+	assertHashReachable(t, dir, v1, "lower-bound commit before rewrite range")
 }
 
 // TestRangeSyntax_ErrorLowerBoundNotResolved verifies error handling.

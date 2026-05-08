@@ -6,7 +6,7 @@ For example, if you accidentally committed sensitive files or build artifacts, t
 
 ## Installation
 
-**Prerequisites:** Go 1.22+ and `git-filter-repo` installed.
+**Prerequisites:** Go 1.22+ and `git` installed.
 
 Build the tool:
 ```bash
